@@ -81,50 +81,40 @@ class PaymentWebhookView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        """
-        Handle PayG payment webhook.
-        """
         webhook_data = request.data
+        logger.info("Webhook received: %s", webhook_data)
 
-        # Log the webhook
+        # Create log
         webhook_log = PaymentWebhookLog.objects.create(
             webhook_data=webhook_data,
             processed=False
         )
 
         try:
-            # Extract webhook fields
             order_id = webhook_data.get('order_id') or webhook_data.get('OrderKeyId')
             transaction_id = webhook_data.get('transaction_id') or webhook_data.get('TransactionId')
             payment_status = webhook_data.get('status', '').upper()
             payment_method = webhook_data.get('payment_method') or webhook_data.get('PaymentMethod')
-            auth_key = request.headers.get('X-PayG-AuthKey') or webhook_data.get('auth_key')
+            auth_key = webhook_data.get('auth_key') or request.headers.get('X-PayG-AuthKey')
 
-            # Validate Order PostBack AuthKey
-            if auth_key != "okjhn78312f8uyt148b304c55723iuyt":
-                return Response({
-                    'success': False,
-                    'error': 'Invalid AuthKey'
-                }, status=400)
+            # Log auth_key for debugging
+            logger.info("Received auth_key: %s", auth_key)
+
+            # Validate AuthKey
+            if auth_key != settings.PAYG_AUTH_KEY:
+                logger.warning("Invalid auth_key received: %s", auth_key)
+                return Response({'success': False, 'error': 'Invalid AuthKey'}, status=403)
 
             if not order_id:
-                return Response({
-                    'success': False,
-                    'error': 'Order ID missing'
-                }, status=400)
+                return Response({'success': False, 'error': 'Order ID missing'}, status=400)
 
             # Fetch payment
-            try:
-                payment = Payment.objects.get(order_id=order_id)
-                webhook_log.payment = payment
-                webhook_log.save()
-            except Payment.DoesNotExist:
-                return Response({
-                    'success': False,
-                    'error': 'Payment not found'
-                }, status=404)
+            payment = Payment.objects.filter(order_id=order_id).first()
+            if not payment:
+                logger.warning("Payment not found for order_id: %s", order_id)
+                return Response({'success': False, 'error': 'Payment not found'}, status=404)
 
-            # Map PayG status to your DB status
+            # Map status
             status_mapping = {
                 'SUCCESS': 'SUCCESS',
                 'COMPLETED': 'SUCCESS',
@@ -138,24 +128,24 @@ class PaymentWebhookView(APIView):
             payment.transaction_id = transaction_id
             payment.payment_method = payment_method
             payment.webhook_response = webhook_data
-            if new_status == 'SUCCESS':
+            if new_status == 'SUCCESS' and not payment.payment_completed_at:
                 payment.payment_completed_at = timezone.now()
             payment.save()
 
-            # Mark webhook as processed
+            # Mark webhook log as processed
+            webhook_log.payment = payment
             webhook_log.processed = True
             webhook_log.save()
 
-            return Response({
-                'success': True,
-                'message': 'Webhook processed successfully'
-            }, status=200)
+            logger.info("Payment updated successfully: %s", order_id)
+            return Response({'success': True, 'message': 'Webhook processed successfully'}, status=200)
 
         except Exception as e:
-            return Response({
-                'success': False,
-                'error': f'Webhook processing error: {str(e)}'
-            }, status=500)
+            logger.exception("Error processing webhook: %s", e)
+            return Response({'success': False, 'error': str(e)}, status=500)
+
+
+
 
 
 
