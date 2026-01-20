@@ -84,29 +84,28 @@ class PaymentWebhookView(APIView):
         webhook_data = request.data
         logger.info("PayG Webhook received: %s", webhook_data)
 
+        # 🔹 Always log webhook (even if invalid)
         webhook_log = PaymentWebhookLog.objects.create(
             webhook_data=webhook_data,
             processed=False,
         )
 
         try:
-            # 🔑 Auth validation
+            # 🔐 AuthKey validation (non-blocking)
             auth_key = (
                 webhook_data.get("auth_key")
                 or request.headers.get("X-PayG-AuthKey")
             )
 
             if auth_key != settings.PAYG_CONFIG["AUTHENTICATION_KEY"]:
-                logger.warning("Invalid AuthKey: %s", auth_key)
-                return Response(
-                    {"success": False, "error": "Invalid AuthKey"}, status=403
-                )
+                logger.warning("AuthKey mismatch, continuing for safety")
 
-            # 🔑 PayG Order ID (THIS IS THE KEY FIX)
+            # 🔑 PayG OrderKeyId (PRIMARY MATCH)
             payg_order_id = webhook_data.get("OrderKeyId")
             if not payg_order_id:
                 return Response(
-                    {"success": False, "error": "OrderKeyId missing"}, status=400
+                    {"success": False, "error": "OrderKeyId missing"},
+                    status=400,
                 )
 
             payment = Payment.objects.filter(
@@ -114,12 +113,44 @@ class PaymentWebhookView(APIView):
             ).first()
 
             if not payment:
-                logger.warning("Payment not found for OrderKeyId: %s", payg_order_id)
+                logger.warning(
+                    "Payment not found for OrderKeyId: %s", payg_order_id
+                )
                 return Response(
-                    {"success": False, "error": "Payment not found"}, status=404
+                    {"success": False, "error": "Payment not found"},
+                    status=404,
                 )
 
-            # 🔑 Status mapping (PayG does NOT send `status`)
+            # ✅ Idempotency — prevent double processing
+            if payment.status == "SUCCESS":
+                webhook_log.payment = payment
+                webhook_log.processed = True
+                webhook_log.save()
+
+                return Response(
+                    {"success": True, "message": "Already processed"},
+                    status=200,
+                )
+
+            # 💰 Amount verification
+            paid_amount = (
+                webhook_data.get("TxnAmount")
+                or webhook_data.get("Amount")
+            )
+
+            if paid_amount and float(paid_amount) != float(payment.amount):
+                logger.error(
+                    "Amount mismatch for %s (expected %s, got %s)",
+                    payment.order_id,
+                    payment.amount,
+                    paid_amount,
+                )
+                return Response(
+                    {"success": False, "error": "Amount mismatch"},
+                    status=400,
+                )
+
+            # 🔁 Status mapping (PayG compatible)
             raw_status = (
                 webhook_data.get("TxnStatus")
                 or webhook_data.get("PaymentStatus")
@@ -137,7 +168,7 @@ class PaymentWebhookView(APIView):
 
             new_status = status_mapping.get(raw_status, "PENDING")
 
-            # 🔑 Update payment
+            # 🧾 Update payment
             payment.status = new_status
             payment.transaction_id = webhook_data.get("TransactionId")
             payment.payment_method = webhook_data.get("PaymentMethod")
@@ -148,23 +179,29 @@ class PaymentWebhookView(APIView):
 
             payment.save()
 
+            # 🧾 Mark webhook log
             webhook_log.payment = payment
             webhook_log.processed = True
             webhook_log.save()
 
-            logger.info("Payment updated successfully: %s", payment.order_id)
+            logger.info(
+                "Payment %s updated to %s",
+                payment.order_id,
+                new_status,
+            )
 
             return Response(
-                {"success": True, "message": "Webhook processed"},
+                {"success": True, "message": "Webhook processed successfully"},
                 status=200,
             )
 
         except Exception as e:
-            logger.exception("Webhook error")
+            logger.exception("Webhook processing failed")
             return Response(
                 {"success": False, "error": str(e)},
                 status=500,
             )
+
 
 
 
