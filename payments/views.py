@@ -19,6 +19,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+
 class InitiatePaymentView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -26,54 +27,83 @@ class InitiatePaymentView(APIView):
         serializer = PaymentInitiateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
-        order_id = f"YK{uuid.uuid4().hex[:12].upper()}"
         user = request.user
+        amount = serializer.validated_data["amount"]
 
+        # 🔑 Internal order ID (YOUR system)
+        order_id = f"YK{uuid.uuid4().hex[:12].upper()}"
+
+        # 1️⃣ Create pending payment FIRST
         payment = Payment.objects.create(
             user=user,
             order_id=order_id,
-            amount=serializer.validated_data['amount'],
+            amount=amount,
             customer_name=user.full_name,
             customer_email=user.email,
-            customer_phone=user.phone or '9999999999',
-            status='PENDING'
+            customer_phone=user.phone or "9999999999",
+            status="PENDING",
         )
 
         payment_gateway = PayGPaymentGateway()
 
         payment_data = {
-            'order_id': order_id,
-            'amount': float(serializer.validated_data['amount']),
-            'customer_name': user.full_name,
-            'customer_email': user.email,
-            'customer_phone': user.phone or '9999999999',
-            'user_id': str(user.id),
-            'callback_url': settings.PAYG_CONFIG['CALLBACK_URL'],
-            'return_url': settings.PAYG_CONFIG['RETURN_URL'],
+            "order_id": order_id,
+            "amount": float(amount),
+            "customer_name": user.full_name,
+            "customer_email": user.email,
+            "customer_phone": user.phone or "9999999999",
+            "user_id": str(user.id),
+            "callback_url": settings.PAYG_CONFIG["CALLBACK_URL"],
+            "return_url": settings.PAYG_CONFIG["RETURN_URL"],
         }
 
         result = payment_gateway.create_payment_request(payment_data)
 
-        if not result['success']:
-            payment.status = 'FAILED'
+        # ❌ Payment gateway failure
+        if not result.get("success"):
+            payment.status = "FAILED"
             payment.payment_gateway_response = result
             payment.save()
 
-            return Response({
-                'success': False,
-                'message': 'Payment initiation failed'
-            }, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {
+                    "success": False,
+                    "message": "Payment initiation failed",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # ✅ SUCCESS
-        payment.payg_order_id = result['data']['OrderKeyId']
-        payment.payment_gateway_response = result['data']
+        # 🔴 VERY IMPORTANT PART 🔴
+        payg_data = result.get("data", {})
+        payg_order_id = payg_data.get("OrderKeyId")
+
+        if not payg_order_id:
+            payment.status = "FAILED"
+            payment.payment_gateway_response = result
+            payment.save()
+
+            return Response(
+                {
+                    "success": False,
+                    "message": "Invalid PayG response (OrderKeyId missing)",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # ✅ SAVE PayG OrderKeyId (WEBHOOK KEY)
+        payment.payg_order_id = payg_order_id
+        payment.payment_gateway_response = payg_data
         payment.save()
 
-        return Response({
-            'success': True,
-            'order_id': order_id,
-            'payment_url': result['data']['PaymentProcessUrl']
-        }, status=status.HTTP_200_OK)
+        return Response(
+            {
+                "success": True,
+                "order_id": order_id,
+                "payment_url": payg_data.get("PaymentProcessUrl"),
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 
 @method_decorator(csrf_exempt, name="dispatch")
@@ -81,17 +111,16 @@ class PaymentWebhookView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
-        webhook_data = request.data
+        webhook_data = request.data or {}
         logger.info("PayG Webhook received: %s", webhook_data)
 
-        # 🔹 Always log webhook (even if invalid)
         webhook_log = PaymentWebhookLog.objects.create(
             webhook_data=webhook_data,
             processed=False,
         )
 
         try:
-            # 🔐 AuthKey validation (non-blocking)
+            # 🔐 Auth validation (DO NOT FAIL HARD)
             auth_key = (
                 webhook_data.get("auth_key")
                 or request.headers.get("X-PayG-AuthKey")
@@ -100,67 +129,36 @@ class PaymentWebhookView(APIView):
             if auth_key != settings.PAYG_CONFIG["AUTHENTICATION_KEY"]:
                 logger.warning("AuthKey mismatch, continuing for safety")
 
-            # 🔑 PayG OrderKeyId (PRIMARY MATCH)
+            # 🔑 PayG OrderKeyId (MAIN KEY)
             payg_order_id = webhook_data.get("OrderKeyId")
             if not payg_order_id:
-                return Response(
-                    {"success": False, "error": "OrderKeyId missing"},
-                    status=400,
-                )
+                logger.error("OrderKeyId missing in webhook")
+                return Response({"success": True}, status=200)
 
             payment = Payment.objects.filter(
                 payg_order_id=payg_order_id
             ).first()
 
             if not payment:
-                logger.warning(
-                    "Payment not found for OrderKeyId: %s", payg_order_id
-                )
-                return Response(
-                    {"success": False, "error": "Payment not found"},
-                    status=404,
-                )
+                logger.error("Payment not found for OrderKeyId: %s", payg_order_id)
+                return Response({"success": True}, status=200)
 
-            # ✅ Idempotency — prevent double processing
-            if payment.status == "SUCCESS":
-                webhook_log.payment = payment
-                webhook_log.processed = True
-                webhook_log.save()
-
-                return Response(
-                    {"success": True, "message": "Already processed"},
-                    status=200,
-                )
-
-            # 💰 Amount verification
-            paid_amount = (
-                webhook_data.get("TxnAmount")
-                or webhook_data.get("Amount")
-            )
-
-            if paid_amount and float(paid_amount) != float(payment.amount):
-                logger.error(
-                    "Amount mismatch for %s (expected %s, got %s)",
-                    payment.order_id,
-                    payment.amount,
-                    paid_amount,
-                )
-                return Response(
-                    {"success": False, "error": "Amount mismatch"},
-                    status=400,
-                )
-
-            # 🔁 Status mapping (PayG compatible)
+            # 🟡 SAFE STATUS HANDLING
             raw_status = (
                 webhook_data.get("TxnStatus")
                 or webhook_data.get("PaymentStatus")
                 or webhook_data.get("status")
                 or ""
-            ).upper()
+            )
+
+            raw_status = str(raw_status).upper()  # 🔥 FIX
 
             status_mapping = {
+                "1": "SUCCESS",
                 "SUCCESS": "SUCCESS",
+                "APPROVED": "SUCCESS",
                 "COMPLETED": "SUCCESS",
+                "0": "FAILED",
                 "FAILED": "FAILED",
                 "FAILURE": "FAILED",
                 "PENDING": "PENDING",
@@ -168,10 +166,10 @@ class PaymentWebhookView(APIView):
 
             new_status = status_mapping.get(raw_status, "PENDING")
 
-            # 🧾 Update payment
+            # 🔄 Update payment
             payment.status = new_status
             payment.transaction_id = webhook_data.get("TransactionId")
-            payment.payment_method = webhook_data.get("PaymentMethod")
+            payment.payment_method = webhook_data.get("PaymentType")
             payment.webhook_response = webhook_data
 
             if new_status == "SUCCESS" and not payment.payment_completed_at:
@@ -179,29 +177,17 @@ class PaymentWebhookView(APIView):
 
             payment.save()
 
-            # 🧾 Mark webhook log
             webhook_log.payment = payment
             webhook_log.processed = True
             webhook_log.save()
 
-            logger.info(
-                "Payment %s updated to %s",
-                payment.order_id,
-                new_status,
-            )
+            logger.info("Payment %s updated to %s", payment.order_id, new_status)
 
-            return Response(
-                {"success": True, "message": "Webhook processed successfully"},
-                status=200,
-            )
+            return Response({"success": True}, status=200)
 
-        except Exception as e:
+        except Exception:
             logger.exception("Webhook processing failed")
-            return Response(
-                {"success": False, "error": str(e)},
-                status=500,
-            )
-
+            return Response({"success": True}, status=200)
 
 
 
