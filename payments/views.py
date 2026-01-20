@@ -15,7 +15,8 @@ from .serializers import (
     PaymentStatusSerializer
 )
 from .utils import PayGPaymentGateway
-
+import looger
+logger = logging.getLogger(__name__)
 
 
 class InitiatePaymentView(APIView):
@@ -84,67 +85,49 @@ class PaymentWebhookView(APIView):
         webhook_data = request.data
         logger.info("Webhook received: %s", webhook_data)
 
-        # Create log
         webhook_log = PaymentWebhookLog.objects.create(
             webhook_data=webhook_data,
             processed=False
         )
 
         try:
-            order_id = webhook_data.get('order_id') or webhook_data.get('OrderKeyId')
-            transaction_id = webhook_data.get('transaction_id') or webhook_data.get('TransactionId')
+            order_id = webhook_data.get('order_id')
+            payg_order_id = webhook_data.get('OrderKeyId')
+            transaction_id = webhook_data.get('TransactionId')
+            payment_method = webhook_data.get('PaymentMethod')
             payment_status = webhook_data.get('status', '').upper()
-            payment_method = webhook_data.get('payment_method') or webhook_data.get('PaymentMethod')
-            auth_key = webhook_data.get('auth_key') or request.headers.get('X-PayG-AuthKey')
 
-            # Log auth_key for debugging
-            logger.info("Received auth_key: %s", auth_key)
+            payment = None
+            if order_id:
+                payment = Payment.objects.filter(order_id=order_id).first()
+            if not payment and payg_order_id:
+                payment = Payment.objects.filter(payg_order_id=payg_order_id).first()
 
-            # Validate AuthKey
-            if auth_key != settings.PAYG_AUTH_KEY:
-                logger.warning("Invalid auth_key received: %s", auth_key)
-                return Response({'success': False, 'error': 'Invalid AuthKey'}, status=403)
-
-            if not order_id:
-                return Response({'success': False, 'error': 'Order ID missing'}, status=400)
-
-            # Fetch payment
-            payment = Payment.objects.filter(order_id=order_id).first()
             if not payment:
-                logger.warning("Payment not found for order_id: %s", order_id)
                 return Response({'success': False, 'error': 'Payment not found'}, status=404)
 
-            # Map status
-            status_mapping = {
-                'SUCCESS': 'SUCCESS',
-                'COMPLETED': 'SUCCESS',
-                'FAILED': 'FAILED',
-                'PENDING': 'PENDING',
-            }
-            new_status = status_mapping.get(payment_status, 'PENDING')
+            if payment_status in ['SUCCESS', 'SUCCESSFUL', 'COMPLETED', 'TXN_SUCCESS']:
+                payment.status = 'SUCCESS'
+                payment.payment_completed_at = timezone.now()
+            elif payment_status in ['FAILED', 'FAILURE', 'TXN_FAILED']:
+                payment.status = 'FAILED'
+            else:
+                payment.status = 'PENDING'
 
-            # Update payment
-            payment.status = new_status
             payment.transaction_id = transaction_id
             payment.payment_method = payment_method
             payment.webhook_response = webhook_data
-            if new_status == 'SUCCESS' and not payment.payment_completed_at:
-                payment.payment_completed_at = timezone.now()
             payment.save()
 
-            # Mark webhook log as processed
             webhook_log.payment = payment
             webhook_log.processed = True
             webhook_log.save()
 
-            logger.info("Payment updated successfully: %s", order_id)
-            return Response({'success': True, 'message': 'Webhook processed successfully'}, status=200)
+            return Response({'success': True}, status=200)
 
         except Exception as e:
-            logger.exception("Error processing webhook: %s", e)
+            logger.exception(e)
             return Response({'success': False, 'error': str(e)}, status=500)
-
-
 
 
 
