@@ -111,9 +111,14 @@ class PaymentWebhookView(APIView):
     permission_classes = [AllowAny]
     
     def post(self, request):
+        try:
+            raw_body = request.body.decode('utf-8')
+            logger.info(f"Raw webhook body: {raw_body}")
+        except:
+            pass
         data = request.data
         logger.info(f"PayG Webhook received: {data}")
-
+        
         # 1. Verify AuthKey
         received_auth_key = data.get("AuthKey")
         expected_auth_key = settings.PAYG_CONFIG["AUTHENTICATION_KEY"]
