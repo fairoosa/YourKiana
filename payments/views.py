@@ -116,61 +116,131 @@ class PaymentWebhookView(APIView):
         logger.info("=" * 50)
         logger.info("WEBHOOK RECEIVED - FULL DATA:")
         logger.info(f"Data: {data}")
-        logger.info(f"AuthKey received: '{data.get('AuthKey')}'")
-        logger.info(f"AuthKey expected: '{settings.PAYG_CONFIG['AUTHENTICATION_KEY']}'")
-        logger.info(f"AuthKey match: {data.get('AuthKey') == settings.PAYG_CONFIG['AUTHENTICATION_KEY']}")
-        logger.info(f"OrderKeyId: {data.get('OrderKeyId')}")
-        logger.info(f"All keys in data: {list(data.keys())}")
         logger.info("=" * 50)
 
-        # 1. Verify AuthKey
-        received_auth_key = data.get("AuthKey")
-        expected_auth_key = settings.PAYG_CONFIG["AUTHENTICATION_KEY"]
+        # 1. Create webhook log entry FIRST (even if processing fails)
+        webhook_log = PaymentWebhookLog.objects.create(
+            webhook_data=data,
+            processed=False
+        )
+        logger.info(f"📝 Webhook log created: ID {webhook_log.id}")
 
-        if received_auth_key != expected_auth_key:
-            logger.error(f"❌ AuthKey mismatch!")
-            logger.error(f"Received: '{received_auth_key}' (type: {type(received_auth_key)})")
-            logger.error(f"Expected: '{expected_auth_key}' (type: {type(expected_auth_key)})")
-            # TEMPORARILY ALLOW IT TO CONTINUE FOR DEBUGGING
-            # return Response({"success": False, "error": "Unauthorized"}, status=403)
+        try:
+            # 2. Get PayG Order ID
+            payg_order_id = data.get("OrderKeyId")
+            if not payg_order_id:
+                logger.error("❌ OrderKeyId missing in webhook")
+                webhook_log.processed = False
+                webhook_log.save()
+                return Response({"success": False, "error": "Missing OrderKeyId"}, status=400)
 
-        # 2. Get PayG Order ID
-        payg_order_id = data.get("OrderKeyId")
-        if not payg_order_id:
-            logger.error("OrderKeyId missing")
-            return Response({"success": False, "error": "Missing OrderKeyId"}, status=400)
+            # 3. Find payment by PayG Order ID
+            payment = Payment.objects.filter(payg_order_id=payg_order_id).first()
+            if not payment:
+                logger.error(f"❌ Payment not found for OrderKeyId: {payg_order_id}")
+                webhook_log.processed = False
+                webhook_log.save()
+                return Response({"success": False, "error": "Payment not found"}, status=404)
 
-        payment = Payment.objects.filter(payg_order_id=payg_order_id).first()
-        if not payment:
-            logger.error(f"Payment not found for OrderKeyId: {payg_order_id}")
-            # Log all payments to see what we have
-            all_payg_ids = Payment.objects.values_list('payg_order_id', flat=True)
-            logger.error(f"Available PayG Order IDs: {list(all_payg_ids)}")
-            return Response({"success": False, "error": "Payment not found"}, status=404)
+            # Link webhook log to payment
+            webhook_log.payment = payment
+            webhook_log.save()
+            logger.info(f"🔗 Webhook log linked to payment: {payment.order_id}")
 
-        # 3. Idempotency: already processed
-        if payment.status == "SUCCESS":
-            logger.info(f"Payment already success: {payg_order_id}")
-            return Response({"success": True}, status=200)
+            # 4. Idempotency: already processed
+            if payment.status == "SUCCESS":
+                logger.info(f"✅ Payment already processed: {payg_order_id}")
+                webhook_log.processed = True
+                webhook_log.save()
+                return Response({"success": True, "message": "Already processed"}, status=200)
 
-        # 4. Update status
-        response_text = data.get("ResponseText", "").lower()
-        logger.info(f"ResponseText: '{response_text}'")
-        
-        if "approved" in response_text or "success" in response_text:
-            payment.status = "SUCCESS"
-            logger.info("✅ Payment marked as SUCCESS")
-        else:
-            payment.status = "FAILED"
-            logger.warning(f"⚠️ Payment marked as FAILED - ResponseText: {response_text}")
+            # 5. Extract payment details from PayG webhook
+            payment_status = data.get("PaymentStatus")
+            payment_response_text = data.get("PaymentResponseText", "").lower()
+            order_payment_status_text = data.get("OrderPaymentStatusText", "").lower()
+            
+            logger.info(f"Payment Status Code: {payment_status}")
+            logger.info(f"Payment Response Text: {payment_response_text}")
+            logger.info(f"Order Payment Status Text: {order_payment_status_text}")
 
-        payment.transaction_id = data.get("TransactionReferenceNo")
-        payment.raw_webhook_response = data
-        payment.save()
+            # 6. Determine if payment is successful
+            is_success = (
+                payment_status == 1 or 
+                "approved" in payment_response_text or 
+                "paid" in order_payment_status_text or
+                "success" in payment_response_text
+            )
 
-        logger.info(f"💾 Payment saved: {payment.order_id} → {payment.status}")
+            if is_success:
+                payment.status = "SUCCESS"
+                payment.payment_completed_at = timezone.now()
+                logger.info(f"✅ Payment marked as SUCCESS: {payment.order_id}")
+            else:
+                payment.status = "FAILED"
+                logger.warning(f"⚠️ Payment marked as FAILED: {payment.order_id}")
 
-        return Response({"success": True}, status=200)
+            # 7. Map PayG payment method to your choices
+            payg_payment_method = data.get("PaymentMethod", "").upper()
+            payment_method_mapping = {
+                "UPI": "UPI",
+                "DEBIT CARD": "DEBIT_CARD",
+                "CREDIT CARD": "CREDIT_CARD",
+                "DEBITCARD": "DEBIT_CARD",
+                "CREDITCARD": "CREDIT_CARD",
+                "NET BANKING": "NET_BANKING",
+                "NETBANKING": "NET_BANKING",
+                "WALLET": "WALLET",
+            }
+            payment.payment_method = payment_method_mapping.get(
+                payg_payment_method, 
+                "UPI"  # Default fallback
+            )
+
+            # 8. Save transaction details
+            payment.transaction_id = (
+                data.get("PaymentTransactionId") or 
+                data.get("PaymentTransactionRefNo") or
+                data.get("TransactionId")
+            )
+            
+            # Save the full webhook response
+            payment.webhook_response = data
+            
+            # Save the payment
+            payment.save()
+
+            # Mark webhook as processed
+            webhook_log.processed = True
+            webhook_log.save()
+
+            logger.info(f"💾 Payment updated successfully:")
+            logger.info(f"   Order ID: {payment.order_id}")
+            logger.info(f"   Status: {payment.status}")
+            logger.info(f"   Transaction ID: {payment.transaction_id}")
+            logger.info(f"   Payment Method: {payment.payment_method}")
+            logger.info(f"   Amount: {payment.amount}")
+
+            return Response({
+                "success": True, 
+                "message": "Payment updated successfully",
+                "order_id": payment.order_id,
+                "status": payment.status
+            }, status=200)
+
+        except Exception as e:
+            logger.error(f"❌ Exception in webhook processing: {str(e)}")
+            logger.exception(e)
+            webhook_log.processed = False
+            webhook_log.save()
+            return Response({
+                "success": False, 
+                "error": "Internal server error"
+            }, status=500)
+
+
+
+
+
 
 
 
